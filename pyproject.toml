@@ -1,0 +1,19 @@
+[project]
+name = "fitgirl-download"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[dependency-groups]
+client = [
+    "aiohttp",
+    "rich",
+    "rarfile",
+]
+server = [
+    "fastapi",
+    "uvicorn",
+    "aiohttp",
+    "beautifulsoup4",
+    "aiofiles",
+    "rich",
+]

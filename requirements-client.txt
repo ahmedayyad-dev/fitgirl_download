@@ -1,3 +1,0 @@
-aiohttp
-rich
-rarfile

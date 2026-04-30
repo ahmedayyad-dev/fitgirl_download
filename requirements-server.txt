@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-aiohttp
-beautifulsoup4
-aiofiles
-rich
