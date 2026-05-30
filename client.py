@@ -22,7 +22,7 @@ from rich.panel import Panel
 
 # ===== SETTINGS =====
 SERVER_URL = os.getenv("FITGIRL_SERVER_URL", "http://62.84.179.0:7284")
-DOWNLOAD_PATH = Path(os.getenv("FITGIRL_LOCAL_PATH", "/media/ahmed/Games/GAMES/GL"))
+DOWNLOAD_PATH = Path(os.getenv("FITGIRL_LOCAL_PATH", "./GAMES"))
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
 console = Console()
