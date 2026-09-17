@@ -61,13 +61,74 @@ async def save_status(folder, name, status, size=None):
                     break
             save_info(folder, info)
 
-async def get_direct_link(session, url):
+# --- روابط مباشرة حسب الـ hoster ---
+HOSTER_LABELS = {'filekeeper': 'FileKeeper.net', 'fuckingfast': 'FuckingFast'}
+
+
+def classify_link(href: str):
+    if 'filekeeper.net/' in href and '/dl/' not in href:
+        return 'filekeeper'
+    if 'fuckingfast.co/' in href and '/dl/' not in href:
+        return 'fuckingfast'
+    return None
+
+
+async def get_fuckingfast_link(session, url):
     try:
         async with session.get(url) as r:
             m = re.search(r'window\.open\(["\']([^"\']+/dl/[^"\']+)["\']', await r.text())
             return m.group(1) if m else None
     except:
         return None
+
+
+async def get_filekeeper_link(url):
+    """FileKeeper: افتح صفحة الملف → POST op=download2 → خد 302 Location مباشرة (الانتظار شغال على JS بس)"""
+    try:
+        # جلسة خاصة لكل ملف عشان الـ cookies (file_code) متتخبطش مع ملفات تانية
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    return None
+                html = await r.text()
+                page_url = str(r.url)
+
+            soup = BeautifulSoup(html, 'html.parser')
+            countdown = soup.find(id='download-countdown')
+            if not countdown:
+                return None
+
+            code = countdown.get('data-code')
+            if not code:
+                return None
+            if countdown.get('data-has-password') == 'true' or countdown.get('data-has-captcha') == 'true':
+                return None
+
+            rand = countdown.get('data-rand') or ''
+            referer = countdown.get('data-referer') or ''
+            method = countdown.get('data-method') or 'Free download'
+
+            data = {
+                'op': 'download2',
+                'id': code,
+                'rand': rand,
+                'referer': referer,
+                'method_free': method,
+                'down_direct': '1',
+            }
+            async with session.post(page_url, data=data, allow_redirects=False,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as p:
+                if p.status == 302:
+                    return p.headers.get('Location')
+            return None
+    except Exception:
+        return None
+
+
+async def get_direct_link(session, link):
+    if link.get('hoster') == 'filekeeper':
+        return await get_filekeeper_link(link['url'])
+    return await get_fuckingfast_link(session, link['url'])
 
 # --- التعديل 2: دالة التحميل المعدلة (Sempahore + No Retry + No Delete) ---
 async def download(session, item, folder, progress, task_id):
@@ -177,10 +238,29 @@ async def main():
         folder = os.path.join(DOWNLOAD_PATH, re.sub(r'[<>:"/\\|?*]', '', game)[:50])
         os.makedirs(folder, exist_ok=True)
 
-        # Get all links
-        is_valid = lambda a: 'fuckingfast.co/' in a['href'] and '/dl/' not in a['href']
-        all_links = [{'url': a['href'], 'name': a.get_text(strip=True)} for a in filter(is_valid, soup.find_all('a', href=True))]
-        if not all_links: return console.print("[red]No links found[/]")
+        # Get all links (حسب كل hoster)
+        links_by_host = {}
+        for a in soup.find_all('a', href=True):
+            host = classify_link(a['href'])
+            name = a.get_text(strip=True)
+            if host and name:
+                links_by_host.setdefault(host, []).append({'url': a['href'], 'name': name, 'hoster': host})
+
+        if not links_by_host: return console.print("[red]No links found[/]")
+
+        # اختر الـ mirror
+        host_keys = list(links_by_host.keys())
+        if len(host_keys) > 1:
+            console.print("\n[cyan]Available mirrors:[/]")
+            for i, h in enumerate(host_keys, 1):
+                console.print(f"  {i}. [yellow]{HOSTER_LABELS.get(h, h)}[/] ({len(links_by_host[h])} files)")
+            pick = console.input("\n[yellow]Choose mirror number: [/]").strip()
+            host = host_keys[int(pick) - 1] if pick.isdigit() and 1 <= int(pick) <= len(host_keys) else host_keys[0]
+        else:
+            host = host_keys[0]
+        console.print(f"\n[cyan]Mirror:[/] {HOSTER_LABELS.get(host, host)} ({len(links_by_host[host])} files)")
+
+        all_links = links_by_host[host]
 
         # Group and select
         groups = group_files(all_links)
@@ -216,12 +296,19 @@ async def main():
             console.print(f"\n[blue]{len(selected)} files to download ({len(done_names)} already done)[/]")
             console.print("\n[cyan]Extracting direct links...[/]")
 
-            # جلب الروابط المباشرة (يمكن تحسينها بـ Semaphore أيضاً لو العدد كبير، لكن سنتركها الآن)
+            # جلب الروابط المباشرة بالتوازي (لـ FileKeeper كل ملف بجلسة مستقلة للكوكيز)
+            resolve_sem = asyncio.Semaphore(5)
+
+            async def resolve_one(link):
+                async with resolve_sem:
+                    return link, await get_direct_link(session, link)
+
+            results = await asyncio.gather(*[resolve_one(l) for l in selected])
+
             files = []
-            for link in selected:
-                dl = await get_direct_link(session, link['url'])
+            for link, dl in results:
                 console.print(f"  [{'green' if dl else 'red'}]{'✓' if dl else '✗'}[/] {link['name']}")
-                if dl: files.append({'name': link['name'], 'url': dl, 'page_url': link['url'], 'status': 'pending'})
+                if dl: files.append({'name': link['name'], 'url': dl, 'page_url': link['url'], 'hoster': host, 'status': 'pending'})
 
             if not files: return console.print("[red]No direct links[/]")
 
