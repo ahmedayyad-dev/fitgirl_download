@@ -7,8 +7,8 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, DownloadColumn, Tr
 from rich.table import Table
 # pip install aiohttp beautifulsoup4 rarfile rich
 
-DOWNLOAD_PATH = "/media/ahmed/Games/GAMES/GL"
-AUTO_EXTRACT = True
+DOWNLOAD_PATH = os.path.expanduser("./Downloads")
+AUTO_EXTRACT = False
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
 INFO_FILE = ".download_info.json"
 
@@ -50,7 +50,7 @@ def group_files(links):
         groups.setdefault(key, []).append(link)
     return groups
 
-async def save_status(folder, name, status, size=None):
+async def save_status(folder, name, status, size=None, size_bytes=None):
     async with info_lock:
         info = load_info(folder)
         if info: # تأكد أن الملف موجود
@@ -58,6 +58,7 @@ async def save_status(folder, name, status, size=None):
                 if f['name'] == name:
                     f['status'] = status
                     if size: f['size'] = size
+                    if size_bytes: f['size_bytes'] = size_bytes
                     break
             save_info(folder, info)
 
@@ -130,43 +131,62 @@ async def get_direct_link(session, link):
         return await get_filekeeper_link(link['url'])
     return await get_fuckingfast_link(session, link['url'])
 
-# --- التعديل 2: دالة التحميل المعدلة (Sempahore + No Retry + No Delete) ---
+# --- التعديل 2: دالة التحميل المعدلة (Sempahore + No Retry + Resume + Verify) ---
 async def download(session, item, folder, progress, task_id):
     # استخدام الـ Semaphore عشان نضمن ان 3 بس هما اللي شغالين تحميل فعلي
     async with sem:
         name, url = item['name'], item['url']
         path = os.path.join(folder, name)
 
-        if os.path.exists(path) and item.get('size'):
-            # زيادة السماحية لـ 10 ميجا عشان فرق الحجم البسيط
-            if abs(os.path.getsize(path) - item['size'] * 1024 * 1024) < 1024 * 1024 * 10:
-                progress.update(task_id, total=1, completed=1, description=f"[green]✓ {name}")
-                return True
+        existing = os.path.getsize(path) if os.path.exists(path) else 0
+
+        # لو الملف موجود وحجمه مطابق للحجم المتوقع → خلص (تحقق دقيق بالبايت)
+        if existing and item.get('size_bytes') and existing == item['size_bytes']:
+            progress.update(task_id, total=existing, completed=existing, description=f"[green]✓ {name}")
+            await save_status(folder, name, 'done', existing / 1024 / 1024, existing)
+            return True
 
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=None, sock_read=60)) as r:
-                if r.status != 200: raise Exception(f"HTTP {r.status}")
+            # لو في جزء محمّل، نكمل من عنده بـ HTTP Range
+            headers = {'Range': f'bytes={existing}-'} if existing else {}
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=None, sock_read=60)) as r:
+                if r.status == 416:
+                    # الملف كامل فعلًا و السيرفر رفض الـ Range
+                    cr = r.headers.get('Content-Range', '')
+                    total = int(cr.split('/')[-1]) if '/' in cr else existing
+                    mode = None
+                else:
+                    if r.status not in (200, 206):
+                        raise Exception(f"HTTP {r.status}")
 
-                # التأكد إنه مش صفحة HTML
-                if 'text' in r.headers.get('Content-Type', ''):
-                    raise Exception("Invalid Content-Type")
+                    # التأكد إنه مش صفحة HTML
+                    if 'text' in r.headers.get('Content-Type', ''):
+                        raise Exception("Invalid Content-Type")
 
-                total = int(r.headers.get('content-length', 0))
-                progress.update(task_id, total=total)
+                    if r.status == 206:
+                        # جزء مكمّل: الحجم الكامل من Content-Range (bytes start-end/total)
+                        total = int(r.headers['Content-Range'].split('/')[-1])
+                        mode = 'ab'
+                    else:
+                        # السيرفر تجاهل الـ Range → نبدأ من الأول
+                        total = int(r.headers.get('content-length', 0))
+                        existing = 0
+                        mode = 'wb'
 
-                with open(path, 'wb') as f:
-                    async for chunk in r.content.iter_chunked(1024 * 1024):
-                        f.write(chunk)
-                        progress.update(task_id, advance=len(chunk))
+                    progress.update(task_id, total=total, completed=existing)
 
-                # التحقق من الحجم بدون حذف الملف
+                    with open(path, mode) as f:
+                        async for chunk in r.content.iter_chunked(1024 * 1024):
+                            f.write(chunk)
+                            progress.update(task_id, advance=len(chunk))
+
+                # --- التحقق من اكتمال الملف بالبايت ---
                 file_size = os.path.getsize(path)
-                if total and file_size < (total * 0.95): # لو أقل من 95% يبقى ناقص
-                    # os.remove(path) <-- تم إيقاف الحذف عشان متخسرش اللي حملته
+                if total and file_size != total:
                     raise Exception(f"Size mismatch: {file_size}/{total}")
 
                 progress.update(task_id, description=f"[green]✓ {name}")
-                await save_status(folder, name, 'done', file_size / 1024 / 1024)
+                await save_status(folder, name, 'done', file_size / 1024 / 1024, file_size)
                 return True
 
         except Exception as e:
