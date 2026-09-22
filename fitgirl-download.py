@@ -5,6 +5,7 @@ import rarfile
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
 from rich.table import Table
+from hosts import extract_mirror_links, get_direct_link, HOSTER_LABELS, PREFERRED_HOSTS
 # pip install aiohttp beautifulsoup4 rarfile rich
 
 DOWNLOAD_PATH = os.path.expanduser("./Downloads")
@@ -62,75 +63,7 @@ async def save_status(folder, name, status, size=None, size_bytes=None):
                     break
             save_info(folder, info)
 
-# --- روابط مباشرة حسب الـ hoster ---
-HOSTER_LABELS = {'filekeeper': 'FileKeeper.net', 'fuckingfast': 'FuckingFast'}
-
-
-def classify_link(href: str):
-    if 'filekeeper.net/' in href and '/dl/' not in href:
-        return 'filekeeper'
-    if 'fuckingfast.co/' in href and '/dl/' not in href:
-        return 'fuckingfast'
-    return None
-
-
-async def get_fuckingfast_link(session, url):
-    try:
-        async with session.get(url) as r:
-            m = re.search(r'window\.open\(["\']([^"\']+/dl/[^"\']+)["\']', await r.text())
-            return m.group(1) if m else None
-    except:
-        return None
-
-
-async def get_filekeeper_link(url):
-    """FileKeeper: افتح صفحة الملف → POST op=download2 → خد 302 Location مباشرة (الانتظار شغال على JS بس)"""
-    try:
-        # جلسة خاصة لكل ملف عشان الـ cookies (file_code) متتخبطش مع ملفات تانية
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status != 200:
-                    return None
-                html = await r.text()
-                page_url = str(r.url)
-
-            soup = BeautifulSoup(html, 'html.parser')
-            countdown = soup.find(id='download-countdown')
-            if not countdown:
-                return None
-
-            code = countdown.get('data-code')
-            if not code:
-                return None
-            if countdown.get('data-has-password') == 'true' or countdown.get('data-has-captcha') == 'true':
-                return None
-
-            rand = countdown.get('data-rand') or ''
-            referer = countdown.get('data-referer') or ''
-            method = countdown.get('data-method') or 'Free download'
-
-            data = {
-                'op': 'download2',
-                'id': code,
-                'rand': rand,
-                'referer': referer,
-                'method_free': method,
-                'down_direct': '1',
-            }
-            async with session.post(page_url, data=data, allow_redirects=False,
-                                    timeout=aiohttp.ClientTimeout(total=30)) as p:
-                if p.status == 302:
-                    return p.headers.get('Location')
-            return None
-    except Exception:
-        return None
-
-
-async def get_direct_link(session, link):
-    if link.get('hoster') == 'filekeeper':
-        return await get_filekeeper_link(link['url'])
-    return await get_fuckingfast_link(session, link['url'])
-
+# --- روابط مباشرة حسب الـ hoster (كل hosters بتتكتشف ديناميكيًا من hosts.py) ---
 # --- التعديل 2: دالة التحميل المعدلة (Sempahore + No Retry + Resume + Verify) ---
 async def download(session, item, folder, progress, task_id):
     # استخدام الـ Semaphore عشان نضمن ان 3 بس هما اللي شغالين تحميل فعلي
@@ -258,13 +191,8 @@ async def main():
         folder = os.path.join(DOWNLOAD_PATH, re.sub(r'[<>:"/\\|?*]', '', game)[:50])
         os.makedirs(folder, exist_ok=True)
 
-        # Get all links (حسب كل hoster)
-        links_by_host = {}
-        for a in soup.find_all('a', href=True):
-            host = classify_link(a['href'])
-            name = a.get_text(strip=True)
-            if host and name:
-                links_by_host.setdefault(host, []).append({'url': a['href'], 'name': name, 'hoster': host})
+        # Get all links (بشكل ديناميكي: كل الـ hosters اللي موجودين في الصفحة)
+        links_by_host = extract_mirror_links(soup)
 
         if not links_by_host: return console.print("[red]No links found[/]")
 
@@ -275,48 +203,59 @@ async def main():
             for i, h in enumerate(host_keys, 1):
                 console.print(f"  {i}. [yellow]{HOSTER_LABELS.get(h, h)}[/] ({len(links_by_host[h])} files)")
             pick = console.input("\n[yellow]Choose mirror number: [/]").strip()
-            host = host_keys[int(pick) - 1] if pick.isdigit() and 1 <= int(pick) <= len(host_keys) else host_keys[0]
+            chosen = host_keys[int(pick) - 1] if pick.isdigit() and 1 <= int(pick) <= len(host_keys) else host_keys[0]
         else:
-            host = host_keys[0]
-        console.print(f"\n[cyan]Mirror:[/] {HOSTER_LABELS.get(host, host)} ({len(links_by_host[host])} files)")
+            chosen = host_keys[0]
 
-        all_links = links_by_host[host]
+        # ترتيب المحاولات: الـ mirror المختار الأول، ثم المفضّلين، ثم الباقي
+        candidates = [chosen]
+        candidates += [h for h in PREFERRED_HOSTS if h in links_by_host and h not in candidates]
+        candidates += [h for h in links_by_host if h not in candidates]
 
-        # Group and select
-        groups = group_files(all_links)
-        console.print(f"\n[green]{game}[/]\n")
-
-        if len(groups) > 1:
-            console.print("[cyan]Available groups:[/]")
-            for i, (key, files) in enumerate(groups.items(), 1):
-                console.print(f"  {i}. [yellow]{key}[/] ({len(files)} files)")
-            console.print(f"\n[blue]Enter numbers (e.g. 1,2,3) or 'all':[/]")
-            choice = console.input("[yellow]> [/]").strip().lower()
-            if choice == 'all':
-                selected = all_links
-            else:
-                keys = list(groups.keys())
-                selected = []
-                for num in choice.replace(' ', '').split(','):
-                    if num.isdigit() and 1 <= int(num) <= len(keys):
-                        selected.extend(groups[keys[int(num) - 1]])
-        else:
-            selected = all_links
-
-        if not selected: return console.print("[red]No files selected[/]")
-
-        # Check what's already done
         info = load_info(folder)
         done_names = set(f['name'] for f in info['files'] if f['status'] == 'done') if info else set()
-        selected = [l for l in selected if l['name'] not in done_names]
+        choice = None  # اختيار المجموعات (بيتسجّل أول مرة وبيتعاد استخدامه مع الـ fallback)
 
-        if not selected:
-            console.print("[green]All selected files already complete![/]")
-        else:
+        files = []
+        for host in candidates:
+            all_links = links_by_host[host]
+            label = HOSTER_LABELS.get(host, host)
+            console.print(f"\n[cyan]Mirror:[/] {label} ({len(all_links)} files)")
+
+            # Group and select
+            groups = group_files(all_links)
+            if len(groups) > 1:
+                if choice is None:
+                    console.print(f"\n[green]{game}[/]\n")
+                    console.print("[cyan]Available groups:[/]")
+                    for i, (key, f) in enumerate(groups.items(), 1):
+                        console.print(f"  {i}. [yellow]{key}[/] ({len(f)} files)")
+                    console.print(f"\n[blue]Enter numbers (e.g. 1,2,3) or 'all':[/]")
+                    choice = console.input("[yellow]> [/]").strip().lower()
+                if choice == 'all':
+                    selected = all_links
+                else:
+                    keys = list(groups.keys())
+                    selected = []
+                    for num in choice.replace(' ', '').split(','):
+                        if num.isdigit() and 1 <= int(num) <= len(keys):
+                            selected.extend(groups[keys[int(num) - 1]])
+            else:
+                selected = all_links
+
+            if not selected:
+                console.print("[red]No files selected[/]")
+                return
+
+            selected = [l for l in selected if l['name'] not in done_names]
+            if not selected:
+                console.print("[green]All selected files already complete![/]")
+                return
+
             console.print(f"\n[blue]{len(selected)} files to download ({len(done_names)} already done)[/]")
-            console.print("\n[cyan]Extracting direct links...[/]")
+            console.print("[cyan]Extracting direct links...[/]")
 
-            # جلب الروابط المباشرة بالتوازي (لـ FileKeeper كل ملف بجلسة مستقلة للكوكيز)
+            # جلب الروابط المباشرة بالتوازي (FileKeeper بيعمل جلسة مستقلة للكوكيز)
             resolve_sem = asyncio.Semaphore(5)
 
             async def resolve_one(link):
@@ -326,49 +265,58 @@ async def main():
             results = await asyncio.gather(*[resolve_one(l) for l in selected])
 
             files = []
-            for link, dl in results:
-                console.print(f"  [{'green' if dl else 'red'}]{'✓' if dl else '✗'}[/] {link['name']}")
-                if dl: files.append({'name': link['name'], 'url': dl, 'page_url': link['url'], 'hoster': host, 'status': 'pending'})
-
-            if not files: return console.print("[red]No direct links[/]")
-
-            # Merge with existing info
-            if info:
-                info['url'] = url
-                existing = {f['name']: f for f in info['files']}
-                for f in files:
-                    existing[f['name']] = f
-                info['files'] = list(existing.values())
-                info['total_files'] = len(info['files'])
-            else:
-                info = {'game': game, 'url': url, 'folder': folder, 'total_files': len(files), 'files': files}
-            save_info(folder, info)
-
-            console.print(f"[blue]Folder: {folder}[/]\n")
-
-            # Download loop
-            while True:
-                pending = pending_files(info)
-                if not pending:
-                    console.print("[green]All files complete![/]")
-                    break
-
-                console.print(f"[cyan]Downloading {len(pending)}/{info['total_files']} files...[/]\n")
-                ok, fail = await download_all(session, pending, folder)
-
-                info = load_info(folder)
-                t = Table(title="Summary")
-                t.add_column("", style="cyan"); t.add_column("Value", style="green")
-                t.add_row("Success", str(ok)); t.add_row("Failed", str(fail))
-                t.add_row("Progress", f"{done_count(info)}/{info['total_files']} ({done_count(info)/info['total_files']*100:.0f}%)")
-                console.print(t)
-
-                if fail:
-                    # بما أننا أوقفنا الـ Retry التلقائي، سنسأل المستخدم أو ننتظر ونحاول مرة أخرى لكل الملفات الفاشلة
-                    console.print(f"\n[yellow]{fail} failed - retrying batch in 5 seconds...[/]")
-                    await asyncio.sleep(5)
+            for link, (dl, reason) in results:
+                if dl:
+                    console.print(f"  [green]✓[/] {link['name']}")
+                    files.append({'name': link['name'], 'url': dl, 'page_url': link['url'],
+                                  'hoster': link.get('hoster', host), 'status': 'pending'})
                 else:
-                    break
+                    console.print(f"  [red]✗[/] {link['name']} [dim]({reason})[/dim]")
+
+            if files:
+                break
+            console.print(f"[yellow]✗ Mirror [{label}] resolved 0/{len(selected)} — trying the next mirror...[/]")
+
+        if not files:
+            return console.print("[red]No direct links from any mirror (hosters are blocked by anti-bot protection).[/]")
+
+        # Merge with existing info
+        if info:
+            info['url'] = url
+            existing = {f['name']: f for f in info['files']}
+            for f in files:
+                existing[f['name']] = f
+            info['files'] = list(existing.values())
+            info['total_files'] = len(info['files'])
+        else:
+            info = {'game': game, 'url': url, 'folder': folder, 'total_files': len(files), 'files': files}
+        save_info(folder, info)
+
+        console.print(f"[blue]Folder: {folder}[/]\n")
+
+        # Download loop
+        while True:
+            pending = pending_files(info)
+            if not pending:
+                console.print("[green]All files complete![/]")
+                break
+
+            console.print(f"[cyan]Downloading {len(pending)}/{info['total_files']} files...[/]\n")
+            ok, fail = await download_all(session, pending, folder)
+
+            info = load_info(folder)
+            t = Table(title="Summary")
+            t.add_column("", style="cyan"); t.add_column("Value", style="green")
+            t.add_row("Success", str(ok)); t.add_row("Failed", str(fail))
+            t.add_row("Progress", f"{done_count(info)}/{info['total_files']} ({done_count(info)/info['total_files']*100:.0f}%)")
+            console.print(t)
+
+            if fail:
+                # بما أننا أوقفنا الـ Retry التلقائي، سنسأل المستخدم أو ننتظر ونحاول مرة أخرى لكل الملفات الفاشلة
+                console.print(f"\n[yellow]{fail} failed - retrying batch in 5 seconds...[/]")
+                await asyncio.sleep(5)
+            else:
+                break
 
         # Extract if all done
         if AUTO_EXTRACT:

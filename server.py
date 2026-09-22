@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+from hosts import extract_mirror_links, resolve_host, HOSTER_LABELS, PREFERRED_HOSTS
 
 # ===== LOGGING =====
 logging.basicConfig(
@@ -51,6 +52,7 @@ DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
 # ===== MODELS =====
 class StartDownloadRequest(BaseModel):
     url: str
+    mirror: str | None = None
 
 
 # ===== APP STATE =====
@@ -102,27 +104,7 @@ def get_short_name(filename: str) -> str:
 
 
 # ===== LINK EXTRACTION =====
-async def get_direct_link(session, url: str, filename: str) -> str | None:
-    short = get_short_name(filename)
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status != 200:
-                log.error(f"  [{short}] Page HTTP {resp.status}")
-                return None
-            html = await resp.text()
-            match = re.search(r'window\.open\(["\']([^"\']+/dl/[^"\']+)["\']', html)
-            if match:
-                log.info(f"  [{short}] Direct link found")
-                return match.group(1)
-            else:
-                log.error(f"  [{short}] No direct link in page")
-                return None
-    except Exception as e:
-        log.error(f"  [{short}] Error: {e}")
-        return None
-
-
-async def extract_download_links(url: str) -> tuple[str, list[dict]]:
+async def extract_download_links(url: str, mirror: str | None = None) -> tuple[str, list[dict]]:
     log.info(f"Extracting links from: {url}")
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
@@ -136,30 +118,29 @@ async def extract_download_links(url: str) -> tuple[str, list[dict]]:
         game_name = title_tag.text.strip() if title_tag else "Unknown Game"
         log.info(f"Game: {game_name}")
 
-        ff_links = []
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if 'fuckingfast.co/' in href and '/dl/' not in href:
-                name = link.get_text(strip=True)
-                if name:
-                    ff_links.append({'url': href, 'name': name})
+        # كل الـ hosters اللي في الصفحة بيتكتشفوا ديناميكيًا
+        links_by_host = extract_mirror_links(soup)
+        log.info(f"Mirrors found: {', '.join(links_by_host) or 'none'}")
+        if not links_by_host:
+            raise HTTPException(status_code=400, detail="No download mirrors found on the page")
 
-        log.info(f"Found {len(ff_links)} fuckingfast.co links")
-        if not ff_links:
-            raise HTTPException(status_code=400, detail="No fuckingfast.co links found")
+        # ترتيب اختيار الـ mirror: mirror محدد من المستخدم (لو موجود) ثم preferred ثم الباقي
+        if mirror and mirror in links_by_host:
+            candidates = [mirror]
+        else:
+            candidates = [h for h in PREFERRED_HOSTS if h in links_by_host]
+            candidates += [h for h in links_by_host if h not in PREFERRED_HOSTS]
 
-        download_links = []
-        for i, link in enumerate(ff_links, 1):
-            log.info(f"  Getting direct link {i}/{len(ff_links)}: {get_short_name(link['name'])}")
-            direct_url = await get_direct_link(session, link['url'], link['name'])
-            if direct_url:
-                download_links.append({'url': direct_url, 'name': link['name']})
+        for host in candidates:
+            links = links_by_host[host]
+            label = HOSTER_LABELS.get(host, host)
+            log.info(f"Trying mirror [{label}] ({len(links)} files)")
+            download_links = await resolve_host(session, links, host, referer=url)
+            log.info(f"  -> {len(download_links)}/{len(links)} direct links")
+            if download_links:
+                return game_name, download_links
 
-        log.info(f"Got {len(download_links)}/{len(ff_links)} direct links")
-        if not download_links:
-            raise HTTPException(status_code=400, detail="No direct links found")
-
-        return game_name, download_links
+        raise HTTPException(status_code=400, detail="No direct links could be resolved from any mirror")
 
 
 # ===== FILE DOWNLOAD WITH RETRY =====
@@ -255,9 +236,9 @@ async def check_game_complete(game_id: str):
 
 
 # ===== GAME DOWNLOAD =====
-async def start_game_download(game_id: str, url: str):
+async def start_game_download(game_id: str, url: str, mirror: str | None = None):
     try:
-        game_name, download_links = await extract_download_links(url)
+        game_name, download_links = await extract_download_links(url, mirror)
 
         game_path = DOWNLOAD_PATH / game_id
         game_path.mkdir(parents=True, exist_ok=True)
@@ -269,6 +250,7 @@ async def start_game_download(game_id: str, url: str):
             filename = file_info['name']
             games_state[game_id]["files"][filename] = {
                 "url": file_info['url'],
+                "hoster": file_info.get('hoster'),
                 "status": "pending",
                 "total_size": 0,
                 "downloaded_size": 0,
@@ -336,13 +318,14 @@ async def start_download_endpoint(request: StartDownloadRequest, background_task
 
     games_state[game_id] = {
         "game_id": game_id, "name": "Loading...", "url": request.url,
+        "mirror": request.mirror,
         "status": "pending", "created_at": datetime.now().isoformat(),
         "files": {}, "error": None
     }
     await save_state()
 
-    background_tasks.add_task(start_game_download, game_id, request.url)
-    return {"game_id": game_id, "message": "Download started"}
+    background_tasks.add_task(start_game_download, game_id, request.url, request.mirror)
+    return {"game_id": game_id, "message": "Download started", "mirror": request.mirror}
 
 
 @app.get("/games")

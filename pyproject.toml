@@ -8,6 +8,8 @@ client = [
     "aiohttp",
     "rich",
     "rarfile",
+    "beautifulsoup4",
+    "curl-cffi",
 ]
 server = [
     "fastapi",
@@ -16,4 +18,5 @@ server = [
     "beautifulsoup4",
     "aiofiles",
     "rich",
+    "curl-cffi",
 ]
